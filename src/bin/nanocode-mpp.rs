@@ -17,7 +17,7 @@ use mpp::{
         directory::{self, MPP_DIRECTORY_URL},
     },
     mcp::client::McpPayment,
-    protocol::methods::tempo::{CHAIN_ID, USDC, machine_token},
+    protocol::methods::tempo::{CHAIN_ID, PATH_USD, USDC, machine_token},
 };
 use nanocode::{
     ClaudeModel, Model,
@@ -51,6 +51,7 @@ struct Mpp {
     events: ClientEvents,
     probe: (String, &'static str),
     warm: Arc<tokio::sync::OnceCell<()>>,
+    route: Option<(&'static str, String)>,
 }
 
 impl Mpp {
@@ -69,6 +70,7 @@ impl Mpp {
             events: payments.events.clone(),
             probe,
             warm: Arc::default(),
+            route: None,
         })
     }
 
@@ -91,6 +93,11 @@ impl Layer for Mpp {
     ) -> BoxFuture<'a, std::result::Result<layer::Response, layer::Error>> {
         Box::pin(async move {
             self.preconnect().await;
+            let mut request = request;
+            if let Some((from, to)) = &self.route {
+                request.url = request.url.replacen(from, to, 1);
+                request.headers.insert("x-mpp-receipt-events", http::HeaderValue::from_static("1"));
+            }
             let url = reqwest::Url::parse(&request.url)
                 .map_err(|error| layer::Error::new(error.to_string()).unsent(true))?;
             let mut paid = reqwest::Request::new(request.method, url);
@@ -659,6 +666,7 @@ fn symbol(currency: &str, machine: Address) -> String {
     match currency.parse::<Address>() {
         Ok(currency) if currency == machine => "MACH".to_owned(),
         Ok(currency) if USDC.parse() == Ok(currency) => "USDC.e".to_owned(),
+        Ok(currency) if PATH_USD.parse() == Ok(currency) => "pathUSD".to_owned(),
         _ => currency.to_owned(),
     }
 }
@@ -683,6 +691,35 @@ fn bar(change: i128, peak: i128) -> char {
 
 fn mach(amount: u128) -> String {
     format!("{}.{:06}", amount / MACH, amount % MACH)
+}
+
+fn boundless(url: &str) -> Result<ModelClients> {
+    nanocode::codex::transport::install_default_rustls_crypto_provider();
+    let endpoint = format!("{}/v1", url.trim_end_matches('/'));
+    let model = std::env::var("BOUNDLESS_MPP_MODEL").unwrap_or_else(|_| "deepseek/deepseek-v4.1-flash-1017".to_owned());
+    let host = reqwest::Url::parse(&endpoint)?.host_str().unwrap_or_default().to_owned();
+    let payments = Payments::new(Address::ZERO, vec![host]);
+    let wallet = TempoAccountsProvider::from_default_store()
+        .map_err(|error| format!("{error}; log in with `tempo wallet login`"))?
+        .with_expected_chain_id(42431)
+        .with_preferred_currency(PATH_USD.parse()?)
+        .with_session_prepaid_requests(PREPAID_REQUESTS)
+        .with_session_events(payments.events.clone())
+        .with_session_default_deposit(amount("NANOCODE_MPP_DEPOSIT", MACH)?)
+        .with_session_top_up_amount(amount("NANOCODE_MPP_DEPOSIT", MACH)?);
+    let mut layer = Mpp::new(&wallet, &endpoint, &payments, (format!("{endpoint}/chat/completions"), "probe"))?;
+    layer.route = Some((nanocode::oai::transport::OPENROUTER_API_BASE_URL, endpoint));
+    let gateway = nanocode::oai::transport::ChatGateway::openrouter().wire_model(model);
+    let (notices, status) = (payments.clone(), payments.clone());
+    Ok(ModelClients::new()
+        .openai(move || {
+            nanocode::codex::OpenAi::builder(nanocode::codex::OpenAiAuth::gateway_managed())
+                .chat_gateway(gateway.clone())
+                .http_layer(layer.clone())
+        })
+        .notices(move || notices.notices())
+        .status(move || status.status())
+        .panel("/spend", "show or hide what models have spent", move || payments.panel()))
 }
 
 fn clients() -> Result<ModelClients> {
@@ -747,7 +784,11 @@ fn clients() -> Result<ModelClients> {
 }
 
 fn main() -> ExitCode {
-    match clients() {
+    let clients = match std::env::var("BOUNDLESS_MPP_URL") {
+        Ok(url) if !url.is_empty() => boundless(&url),
+        _ => clients(),
+    };
+    match clients {
         Ok(clients) => nanocode_cli::run_with(clients),
         Err(error) => {
             eprintln!("nanocode-mpp: {error}");
