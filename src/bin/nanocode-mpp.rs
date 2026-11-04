@@ -716,8 +716,17 @@ fn endpoint_clients(url: &str) -> Result<ModelClients> {
         .with_session_events(payments.events.clone())
         .with_session_default_deposit(amount("NANOCODE_MPP_DEPOSIT", MACH)?)
         .with_session_top_up_amount(amount("NANOCODE_MPP_DEPOSIT", MACH)?);
+    // The picker lists the endpoint's own models (nanocode reads
+    // NANOCODE_MODELS_URL at startup) and sends the chosen ID unchanged.
+    // CUSTOM_MODEL, when set, is registered first so it is the default.
+    if std::env::var_os("NANOCODE_MODELS_URL").is_none() {
+        // SAFETY: called from main before any other thread starts.
+        unsafe { std::env::set_var("NANOCODE_MODELS_URL", format!("{endpoint}/models")) };
+    }
+    if let Some(model) = &model {
+        Model::register_served([model.as_str()]);
+    }
     let mut layer = Mpp::new(&wallet, &endpoint, &payments, (format!("{endpoint}/responses"), "probe"))?;
-    layer.model = model;
     let origin = reqwest::Url::parse(&endpoint)?.origin().ascii_serialization();
     let namespace = match session_slot(&origin)?.as_str() {
         "0" => origin,
