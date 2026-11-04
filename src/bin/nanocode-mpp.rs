@@ -410,9 +410,16 @@ impl Payments {
             })
             .collect();
         let rate = u128::try_from(window).unwrap_or(0) * 60 / WATERFALL.as_secs() as u128;
+        // The rate sums every service: name their token when they share one, else USD (all are 1:1).
+        let unit = match services.first() {
+            Some((_, first)) if services.iter().all(|(_, s)| s.symbol == first.symbol) => {
+                first.symbol.as_str()
+            }
+            _ => "USD",
+        };
         Some(Panel {
             title: format!(
-                "⚡ {} streamed · {calls} paid calls · {} services · {} MACH/min",
+                "⚡ {} streamed · {calls} paid calls · {} services · {} {unit}/min",
                 ledger.totals(),
                 services.len(),
                 mach(rate)
@@ -700,13 +707,27 @@ fn endpoint_clients(url: &str) -> Result<(ModelClients, Option<(TempoSessionProv
         false => format!("https://{url}/v1"),
     };
     let models = served_models(&endpoint)?;
+    let offered = endpoint_chains(&endpoint, models[0].as_str());
     let (chain, default) = match std::env::var("MPP_NETWORK").as_deref() {
         Ok("mainnet") => (CHAIN_ID, USDC),
-        Ok("testnet") | Err(_) => (42431, PATH_USD),
+        Ok("testnet") => (42431, PATH_USD),
+        Err(_) if offered == [CHAIN_ID] => (CHAIN_ID, USDC),
+        Err(_) => (42431, PATH_USD),
         Ok(other) => {
             return Err(format!("MPP_NETWORK must be mainnet or testnet, not {other}").into());
         }
     };
+    // A wallet on the wrong network fails much later, in gas estimation, with "invalid chain ID".
+    if !offered.is_empty() && !offered.contains(&chain) {
+        let wanted = match offered.contains(&CHAIN_ID) {
+            true => "mainnet",
+            false => "testnet",
+        };
+        return Err(format!(
+            "{endpoint} takes payment on chain {offered:?}, not {chain}; set MPP_NETWORK={wanted}"
+        )
+        .into());
+    }
     let default: Address = default.parse()?;
     let wanted = std::env::var("MPP_CURRENCY")
         .unwrap_or_default()
@@ -820,6 +841,53 @@ fn close_session(session: TempoSessionProvider, url: String) {
         }
     }
     eprintln!("nanocode-mpp: the session stayed busy; the next run closes it");
+}
+
+/// The chains an endpoint's unpaid 402 offers sessions on, read from each challenge's
+/// `methodDetails.chainId`. Empty when the probe fails; the caller then trusts MPP_NETWORK.
+fn endpoint_chains(endpoint: &str, model: &str) -> Vec<u64> {
+    let url = format!("{endpoint}/chat/completions");
+    let body = serde_json::json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return Vec::new();
+    };
+    let headers = runtime.block_on(async {
+        let response = reqwest::Client::new()
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        (response.status() == reqwest::StatusCode::PAYMENT_REQUIRED).then(|| {
+            response
+                .headers()
+                .get_all(reqwest::header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|value| value.to_str().ok().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+    });
+    let mut chains = Vec::new();
+    for challenge in mpp::protocol::core::parse_www_authenticate_all(
+        headers.iter().flatten().map(String::as_str),
+    )
+    .into_iter()
+    .flatten()
+    {
+        if let Some(chain) = challenge
+            .request
+            .decode_value()
+            .ok()
+            .and_then(|request| request["methodDetails"]["chainId"].as_u64())
+            && !chains.contains(&chain)
+        {
+            chains.push(chain);
+        }
+    }
+    chains
 }
 
 fn served_models(endpoint: &str) -> Result<Vec<Model>> {
