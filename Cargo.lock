@@ -4311,6 +4311,7 @@ dependencies = [
  "nanocode-cli",
  "reqwest",
  "serde_json",
+ "tempo-alloy",
  "tokio",
 ]
 

@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::Stream;
 use mpp::{
-    Address, MppError, PaymentChallenge, PaymentCredential,
+    Address, MppError, PaymentChallenge, PaymentCredential, PrivateKeySigner,
     client::{
         AcceptPaymentPolicy, ClientEventSubscription, ClientEvents, DEFAULT_MAX_PAYMENT_RETRIES,
         DepositContext, Exchange, FlowError, ForwardProxy, ManagementFuture, ManagementTransport,
@@ -27,6 +27,7 @@ use nanocode::{
 use nanocode_cli::{ModelClients, Panel};
 use reqwest::ResponseBuilderExt;
 use serde_json::Value;
+use tempo_alloy::accounts::TempoAccountsWallet;
 use tokio::sync::mpsc::UnboundedSender;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -708,8 +709,7 @@ fn endpoint_clients(url: &str) -> Result<ModelClients> {
     };
     let host = reqwest::Url::parse(&endpoint)?.host_str().unwrap_or_default().to_owned();
     let payments = Payments::new(Address::ZERO, vec![host.clone()]);
-    let wallet = TempoAccountsProvider::from_default_store()
-        .map_err(|error| format!("{error}; log in with `tempo wallet login`"))?
+    let wallet = endpoint_wallet(chain)?
         .with_expected_chain_id(chain)
         .with_preferred_currency(currency.parse()?)
         .with_session_prepaid_requests(PREPAID_REQUESTS)
@@ -735,6 +735,35 @@ fn endpoint_clients(url: &str) -> Result<ModelClients> {
         .notices(move || notices.notices())
         .status(move || status.status())
         .panel("/spend", "show or hide what models have spent", move || payments.panel()))
+}
+
+/// The custom endpoint's wallet: a local secp256k1 key from `TEMPO_PRIVATE_KEY` (or the file named
+/// by `TEMPO_PRIVATE_KEY_FILE`) paying from its own address, else the `tempo wallet login` store.
+/// A local key lets `TEMPO_PRIVATE_KEY=<key> tempo wallet sessions close <id> --cooperative` close
+/// the channels it opened. The key is never printed, even when it fails to parse.
+fn endpoint_wallet(chain: u64) -> Result<TempoAccountsProvider> {
+    let key = match std::env::var("TEMPO_PRIVATE_KEY") {
+        Ok(key) if !key.trim().is_empty() => Some(key),
+        _ => match std::env::var_os("TEMPO_PRIVATE_KEY_FILE").filter(|path| !path.is_empty()) {
+            Some(path) => Some(std::fs::read_to_string(&path).map_err(|error| {
+                format!("cannot read TEMPO_PRIVATE_KEY_FILE {}: {error}", std::path::Path::new(&path).display())
+            })?),
+            None => None,
+        },
+    };
+    let Some(key) = key else {
+        return Ok(TempoAccountsProvider::from_default_store()
+            .map_err(|error| format!("{error}; log in with `tempo wallet login` or set TEMPO_PRIVATE_KEY"))?);
+    };
+    let key = key.trim();
+    let hex = key.strip_prefix("0x").unwrap_or_default();
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("TEMPO_PRIVATE_KEY must be a 0x-prefixed 32-byte hex secp256k1 key".into());
+    }
+    let signer: PrivateKeySigner =
+        key.parse().map_err(|_| "TEMPO_PRIVATE_KEY is not a valid secp256k1 private key")?;
+    let wallet = TempoAccountsWallet::from_secp256k1(signer.address(), signer, None).with_chain_id(chain);
+    Ok(TempoAccountsProvider::new(wallet))
 }
 
 fn session_slot(origin: &str) -> Result<String> {
