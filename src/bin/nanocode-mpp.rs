@@ -17,7 +17,7 @@ use mpp::{
         directory::{self, MPP_DIRECTORY_URL},
     },
     mcp::client::McpPayment,
-    protocol::methods::tempo::{CHAIN_ID, USDC, machine_token},
+    protocol::methods::tempo::{CHAIN_ID, PATH_USD, USDC, machine_token},
 };
 use nanocode::{
     ClaudeModel, Model,
@@ -348,11 +348,13 @@ impl Payments {
 
     fn mcp(&self, wallet: &TempoAccountsProvider, url: &str) -> Result<McpServer> {
         let url: reqwest::Url = url.parse()?;
-        Ok(McpServer::http(url.as_str()).payment_provider(Arc::new(McpPayments {
-            wallet: self.sessions(wallet, &url)?,
-            url,
-            payments: self.clone(),
-        })))
+        Ok(
+            McpServer::http(url.as_str()).payment_provider(Arc::new(McpPayments {
+                wallet: self.sessions(wallet, &url)?,
+                url,
+                payments: self.clone(),
+            })),
+        )
     }
 
     fn notices(&self) -> impl Stream<Item = String> + use<> {
@@ -535,7 +537,11 @@ impl McpPayments {
             },
         );
         let pending = match management {
-            Some(management) => payment.prepare_with_management(&challenges, management).await,
+            Some(management) => {
+                payment
+                    .prepare_with_management(&challenges, management)
+                    .await
+            }
             None => payment.prepare(&challenges).await,
         }
         .map_err(|error| error.to_string())?;
@@ -659,6 +665,7 @@ fn symbol(currency: &str, machine: Address) -> String {
     match currency.parse::<Address>() {
         Ok(currency) if currency == machine => "MACH".to_owned(),
         Ok(currency) if USDC.parse() == Ok(currency) => "USDC.e".to_owned(),
+        Ok(currency) if PATH_USD.parse() == Ok(currency) => "pathUSD".to_owned(),
         _ => currency.to_owned(),
     }
 }
@@ -683,6 +690,164 @@ fn bar(change: i128, peak: i128) -> char {
 
 fn mach(amount: u128) -> String {
     format!("{}.{:06}", amount / MACH, amount % MACH)
+}
+
+fn endpoint_clients(url: &str) -> Result<(ModelClients, Option<(TempoSessionProvider, String)>)> {
+    nanocode::codex::transport::install_default_rustls_crypto_provider();
+    let url = url.trim_end_matches('/');
+    let endpoint = match url.contains("://") {
+        true => format!("{url}/v1"),
+        false => format!("https://{url}/v1"),
+    };
+    let models = served_models(&endpoint)?;
+    let (chain, currency) = match std::env::var("MPP_NETWORK").as_deref() {
+        Ok("mainnet") => (CHAIN_ID, USDC),
+        Ok("testnet") | Err(_) => (42431, PATH_USD),
+        Ok(other) => {
+            return Err(format!("MPP_NETWORK must be mainnet or testnet, not {other}").into());
+        }
+    };
+    let host = reqwest::Url::parse(&endpoint)?
+        .host_str()
+        .unwrap_or_default()
+        .to_owned();
+    let payments = Payments::new(Address::ZERO, vec![host.clone()]);
+    let wallet = TempoAccountsProvider::from_default_store()
+        .map_err(|error| format!("{error}; log in with `tempo wallet login`"))?
+        .with_expected_chain_id(chain)
+        .with_preferred_currency(currency.parse()?)
+        .with_session_prepaid_requests(PREPAID_REQUESTS)
+        .with_session_events(payments.events.clone())
+        .with_session_default_deposit(amount("NANOCODE_MPP_DEPOSIT", MACH)?)
+        .with_session_top_up_amount(amount("NANOCODE_MPP_DEPOSIT", MACH)?);
+    let mut layer = Mpp::new(
+        &wallet,
+        &endpoint,
+        &payments,
+        (format!("{endpoint}/responses"), models[0].as_str()),
+    )?;
+    let origin = reqwest::Url::parse(&endpoint)?
+        .origin()
+        .ascii_serialization();
+    let namespace = match session_slot(&origin)?.as_str() {
+        "0" => origin,
+        session => format!("{origin}#{session}"),
+    };
+    let store = mpp::client::tempo::session::store::SqliteChannelStore::open(
+        mpp::client::tempo::session::store::SqliteChannelStoreOptions {
+            namespace,
+            path: None,
+            request_url: Some(endpoint.clone()),
+        },
+    )?;
+    layer.wallet = layer.wallet.clone().with_session_store(Arc::new(store));
+    let session = layer.wallet.session()?;
+    payments
+        .ledger
+        .lock()
+        .unwrap()
+        .sessions
+        .insert(host, session.clone());
+    let close = match std::env::var("MPP_KEEP_SESSION").as_deref() {
+        Ok("1") | Ok("true") => None,
+        _ => Some((session, format!("{endpoint}/responses"))),
+    };
+    let (notices, status) = (payments.clone(), payments.clone());
+    let clients = ModelClients::new()
+        .openai_endpoint(&endpoint, layer)
+        .models(models)
+        .notices(move || notices.notices())
+        .status(move || status.status())
+        .panel("/spend", "show or hide what models have spent", move || {
+            payments.panel()
+        });
+    Ok((clients, close))
+}
+
+fn close_session(session: TempoSessionProvider, url: String) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return eprintln!("nanocode-mpp: closing the session: {error}"),
+    };
+    let client = reqwest::Client::new();
+    for _ in 0..12 {
+        match runtime.block_on(session.close(&client, &url)) {
+            Ok(Some(receipt)) => {
+                return eprintln!(
+                    "nanocode-mpp: closed the session cooperatively (receipt {})",
+                    receipt.reference
+                );
+            }
+            Ok(None) => return,
+            Err(error) if error.to_string().contains(" 409 ") => {
+                runtime.block_on(tokio::time::sleep(Duration::from_secs(5)));
+            }
+            Err(error) => {
+                return eprintln!(
+                    "nanocode-mpp: closing the session: {error}; MPP_KEEP_SESSION=1 keeps it open"
+                );
+            }
+        }
+    }
+    eprintln!("nanocode-mpp: the session stayed busy; the next run closes it");
+}
+
+fn served_models(endpoint: &str) -> Result<Vec<Model>> {
+    let url = format!("{endpoint}/models");
+    let body = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async { reqwest::get(&url).await?.error_for_status()?.bytes().await })
+        .map_err(|error| format!("listing models at {url}: {error}"))?;
+    let listing: Value = serde_json::from_slice(&body)?;
+    let mut models = Vec::new();
+    for entry in listing["data"]
+        .as_array()
+        .ok_or_else(|| format!("{url} returned no data list"))?
+    {
+        let model = entry["id"]
+            .as_str()
+            .ok_or_else(|| format!("{url} listed a model without an id"))?
+            .parse::<Model>()?;
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    if models.is_empty() {
+        return Err(format!("{url} lists no models").into());
+    }
+    Ok(models)
+}
+
+fn session_slot(origin: &str) -> Result<String> {
+    if let Ok(name) = std::env::var("MPP_SESSION")
+        && !name.trim().is_empty()
+    {
+        return Ok(name.trim().to_owned());
+    }
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let dir = std::path::Path::new(&home).join(".tempo/wallet/mpp-sessions");
+    std::fs::create_dir_all(&dir)?;
+    let key: String = origin
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    for slot in 0..64 {
+        let lock = dir.join(format!("{key}-{slot}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock)?;
+        if file.try_lock().is_ok() {
+            std::mem::forget(file);
+            return Ok(slot.to_string());
+        }
+    }
+    Err("64 agents already pay this endpoint from this wallet".into())
 }
 
 fn clients() -> Result<ModelClients> {
@@ -747,8 +912,18 @@ fn clients() -> Result<ModelClients> {
 }
 
 fn main() -> ExitCode {
-    match clients() {
-        Ok(clients) => nanocode_cli::run_with(clients),
+    let clients = match std::env::var("MPP_ENDPOINT") {
+        Ok(url) if !url.is_empty() => endpoint_clients(&url),
+        _ => clients().map(|clients| (clients, None)),
+    };
+    match clients {
+        Ok((clients, close)) => {
+            let code = nanocode_cli::run_with(clients);
+            if let Some((session, url)) = close {
+                close_session(session, url);
+            }
+            code
+        }
         Err(error) => {
             eprintln!("nanocode-mpp: {error}");
             ExitCode::FAILURE
